@@ -40,6 +40,27 @@ var otherStruct struct {
 	guardedField3 int
 }
 
+// A single declaration attaches its documentation to the declaration, not to
+// the specification within it. The annotation applies in either place, as it
+// does for a trailing comment and for every name in the specification.
+
+// +checklocks:globalMu
+var guardedGlobal int
+
+var guardedGlobalTrailing int // +checklocks:globalMu
+
+// +checklocks:globalMu
+var guardedGlobalFirst, guardedGlobalSecond int
+
+// Documentation on a parenthesized declaration applies to every specification
+// within it, as it does for a parenthesized type declaration.
+//
+// +checklocks:globalMu
+var (
+	guardedGlobalBlockOne int
+	guardedGlobalBlockTwo int
+)
+
 func testGlobalValid() {
 	globalMu.Lock()
 	otherStruct.guardedField1 = 1
@@ -98,6 +119,26 @@ func testGlobalInvalid() {
 	otherStruct.guardedField1 = 1 // +checklocksfail
 	otherStruct.guardedField2 = 1 // +checklocksfail
 	otherStruct.guardedField3 = 1 // +checklocksfail
+}
+
+func testGuardedGlobalValid() {
+	globalMu.Lock()
+	guardedGlobal = 1
+	guardedGlobalTrailing = 1
+	guardedGlobalFirst = 1
+	guardedGlobalSecond = 1
+	guardedGlobalBlockOne = 1
+	guardedGlobalBlockTwo = 1
+	globalMu.Unlock()
+}
+
+func testGuardedGlobalInvalid() {
+	guardedGlobal = 1         // +checklocksfail
+	guardedGlobalTrailing = 1 // +checklocksfail
+	guardedGlobalFirst = 1    // +checklocksfail
+	guardedGlobalSecond = 1   // +checklocksfail
+	guardedGlobalBlockOne = 1 // +checklocksfail
+	guardedGlobalBlockTwo = 1 // +checklocksfail
 }
 
 func testCrosspkgGlobalValid() {
