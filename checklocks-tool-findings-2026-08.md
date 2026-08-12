@@ -10,9 +10,9 @@ tool builds.
 | # | Finding | Severity | Status |
 |---|---|---|---|
 | 1 | Panic on cross-package use of unexported global guards | crash | **Fixed — google/gvisor#14078** (CLA green, in review) |
-| 2 | Pointer-typed package-variable guards resolve inconsistently | silent non-enforcement + false positives | Candidate issue, evidence complete |
-| 3 | Annotations on bare package-level vars are silent no-ops | silent non-enforcement | Candidate issue, evidence complete |
-| 4 | Undocumented behaviors relied on in practice | doc gap | Partially addressed in #14078 |
+| 2 | Pointer-typed package-variable guards resolve inconsistently | silent non-enforcement + false positives | **Fixed — fork PR #3** (upstream submission pending) |
+| 3 | Guard annotations silently dropped on some `var` declaration forms (corrected diagnosis; originally "bare vars can't be guarded") | silent non-enforcement | **Fixed — fork PR #4** (upstream submission pending) |
+| 4 | Undocumented behaviors relied on in practice | doc gap | Partially addressed in #14078 / PR #4 |
 
 ## 1. Panic: unexported global guard, cross-package use (FIXED)
 
@@ -55,7 +55,7 @@ trees, and with injected diagnostics covering every annotation class — while t
 pre-fix binary panicked on exactly the packages that are cross-package users of
 newly added global-guard annotations.
 
-## 2. Pointer-typed package-variable guards resolve inconsistently (CANDIDATE ISSUE)
+## 2. Pointer-typed package-variable guards resolve inconsistently (FIXED — fork PR #3)
 
 For `var d = &dispatcher{...}` (a pointer-typed package-level variable), a FUNCTION
 annotation naming `d.lock` resolves to the field of the variable itself, while an
@@ -80,23 +80,47 @@ The two forms never unify. Consequences, all verified:
   the function-annotation path mismatches.
 - Identical behavior in pre- and post-#14078 builds: pre-existing and independent.
 
-Suggested thesis for the issue: annotations naming a field of a pointer-typed
-package-level variable should resolve through the pointer (matching acquisitions),
-or be rejected at parse time — never silently mismatch.
+Root cause (established by the fix): the `ssa.Value` for a package-level variable is
+the ADDRESS of the variable, one indirection above its declared type. A value-typed
+global needs only `FieldAddr`; a pointer-typed global needs a load first, and
+`maybeFindFieldListObj`/`resolveStruct` silently chased the pointer while computing
+field indices, discarding the fact that a dereference was required. The same defect
+covered two further variants the probes had not reached: a package variable that IS
+a pointer-typed lock (`var muPtr = &sync.Mutex{}`), and interface-typed variables.
 
-## 3. Annotations on bare package-level vars are silent no-ops (CANDIDATE ISSUE)
+Fix (fork PR #3): `globalGuard` records whether resolution must dereference the base
+value; applied at resolution so annotations unify with acquisitions. Before/after:
+inert exclusions now report, false-positive preconditions now clean, value-typed
+controls unchanged, whole-test-tree otherwise identical. Externally validated on the
+YuniKorn shim dispatcher probes (the motivating case). Two honest limits recorded in
+the PR: a lock reached via an accessor function (`d := getDispatcher()`) still does
+not unify (value-flow aliasing, a separate pre-existing limitation), and #14078's
+unexported-guard skip still applies cross-package.
 
-`+checklocks:<globalMu>` attached to a bare package-level variable parses without
-complaint and enforces nothing. Field annotations bind to struct fields only.
-Verified in one run: a guarded field of a global struct is enforced
-(`invalid field access ... {global:...}`), while a bare var carrying the identical
-annotation produces no diagnostic for an unguarded read.
+## 3. Guard annotations dropped on some `var` declaration forms (FIXED — fork PR #4; corrected diagnosis)
 
-This is a green-washing hazard: the annotation looks like coverage and is coverage
-of nothing. The README documents what may serve as a *guard* but never states that
-the guarded *entity* must be a struct field. Suggested fix: warn (or error) at parse
-time when a lock annotation is attached to a non-field entity; document the
-restriction either way.
+Original (wrong) diagnosis: "bare package-level vars cannot be guarded entities."
+That is refuted by gVisor's own `test/crosspkg`, which guards the package-level
+`Foo` with `+checklocks:FooMu` and asserts enforcement — passing on master.
+
+Actual defect: COMMENT PLACEMENT. For a parenthesized `var (...)` block the doc
+comment attaches to the inner `ValueSpec`; for a single non-parenthesized `var` it
+attaches to the `GenDecl`, and the fact extractor read only `ValueSpec.Doc` — so
+`GenDecl.Doc`, trailing `ValueSpec.Comment`, and second-and-later names in a spec
+were all silently dropped. (Types already handled all three comment positions;
+globals were missing the same treatment.) Our probe happened to use a dropped
+placement, hence the over-general first diagnosis.
+
+Fix (fork PR #4): read all three comment positions and apply to every declared name,
+mirroring the existing type-alias handling. A briefed alternative — rejecting
+annotations on non-field entities — would have BROKEN working code and was correctly
+not implemented. gVisor-tree impact: zero (no annotations in affected placements;
+verified by scan and by before/after runs over the seven most-annotated packages).
+README now states where global-variable guard annotations may be placed.
+
+Still a green-washing lesson for adopters: an annotation in a dropped placement was
+silently inert. The canary-style self-test pattern (assert a known violation is
+detected) is what catches this class in CI.
 
 ## 4. Documented-behavior gaps relied on in practice
 
@@ -117,9 +141,12 @@ restriction either way.
   (`test/crosspkg` + `test/globals.go`, `+checklocksfail` expectations verified
   load-bearing), README notes.
 - Two-commit review copy: fork PR #1 (`checklocks-unexported-global-guard`).
-- Finding 2 probes: four probe variants (unguarded read / guarded read /
-  exclusion-while-held direct and via accessor) plus the dual-resolution
-  precondition probe, run against a pointer-typed global; reproducible on any such
-  variable.
-- Finding 3 probe: identical annotation on a bare var vs a global struct field,
-  one run, one diagnostic.
+- Finding 2 fix: fork PR #3 (`checklocks-pointer-global-guards`) — tests in
+  test/globals.go + crosspkg cover pointer-typed struct globals, pointer-typed lock
+  variables, and interface-typed variables; externally validated on the YuniKorn
+  shim dispatcher probes.
+- Finding 3 fix: fork PR #4 (`checklocks-annotation-placement-check` branch name
+  retained from the original diagnosis) — tests cover all three previously-dropped
+  comment placements.
+- Merge-order note: #14078, PR #3 and PR #4 all touch test/globals.go (PR #3 also
+  overlaps #14078 in facts.go/crosspkg); they have not been tested merged together.
