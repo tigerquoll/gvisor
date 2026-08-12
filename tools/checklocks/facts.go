@@ -112,6 +112,10 @@ type fieldList []fieldEntry
 type resolvedValue struct {
 	value     ssa.Value
 	fieldList fieldList
+
+	// deref indicates that value must be loaded before the fieldList is
+	// applied. See makeDerefResolvedValue.
+	deref bool
 }
 
 // makeResolvedValue makes a new resolvedValue.
@@ -119,6 +123,22 @@ func makeResolvedValue(v ssa.Value, fl fieldList) resolvedValue {
 	return resolvedValue{
 		value:     v,
 		fieldList: fl,
+	}
+}
+
+// makeDerefResolvedValue makes a new resolvedValue that is loaded before the
+// fieldList is applied.
+//
+// This is required when the value is the address of a variable that itself
+// holds a reference, i.e. a package-level variable of pointer or interface
+// type. Such a variable must be loaded before it can be traversed, and the
+// load is what an acquisition of the lock produces naturally. See
+// findGlobalGuard.
+func makeDerefResolvedValue(v ssa.Value, fl fieldList) resolvedValue {
+	return resolvedValue{
+		value:     v,
+		fieldList: fl,
+		deref:     true,
 	}
 }
 
@@ -138,6 +158,15 @@ func (rv *resolvedValue) valueAndObject(ls *lockState) (string, types.Object) {
 	// resolution, and 2) obj may be nil if there is no source object.
 	s, obj := ls.valueAndObject(rv.value)
 	typ := rv.value.Type()
+	if rv.deref {
+		// Emit the load, and drop the corresponding pointer from the
+		// type. Note that the object is unchanged: it is the variable
+		// being loaded, and its type is already the loaded type.
+		s = fmt.Sprintf("*(%s)", s)
+		if ptr, ok := typ.Underlying().(*types.Pointer); ok {
+			typ = ptr.Elem()
+		}
+	}
 	for _, entry := range rv.fieldList {
 		s, obj = entry.synthesize(s, typ)
 		typ = obj.Type()
@@ -191,6 +220,10 @@ type globalGuard struct {
 
 	// FieldList is the traversal path from object.
 	FieldList fieldList
+
+	// Deref indicates that the object holds a reference, and must be
+	// loaded before the FieldList is applied. See findGlobalGuard.
+	Deref bool
 }
 
 // ssaPackager returns the ssa package.
@@ -206,6 +239,9 @@ func (g *globalGuard) resolveCommon(pc *passContext, ls *lockState) resolvedValu
 		pkg = state.Pkg.Prog.ImportedPackage(g.PackageName)
 	}
 	v := pkg.Members[g.ObjectName].(ssa.Value)
+	if g.Deref {
+		return makeDerefResolvedValue(v, g.FieldList)
+	}
 	return makeResolvedValue(v, g.FieldList)
 }
 
@@ -800,7 +836,25 @@ func (pc *passContext) findGlobalGuard(pos token.Pos, guardName string) (*global
 		ObjectName:  parts[0],
 		PackageName: pc.pass.Pkg.Path(),
 		FieldList:   fl,
+		Deref:       holdsReference(globalObj),
 	}, lockObj, true
+}
+
+// holdsReference indicates whether the object holds a reference, rather than
+// the value itself.
+//
+// The ssa.Value for a package-level variable is the address of the variable.
+// If the variable holds a reference, then it must be loaded before it can be
+// used or traversed, and every acquisition of the lock emits that load. The
+// annotation must resolve to the same value, or the two never unify. This is
+// not required for parameters, which are the value itself.
+func holdsReference(obj types.Object) bool {
+	switch types.Unalias(obj.Type()).Underlying().(type) {
+	case *types.Pointer, *types.Interface:
+		return true
+	default:
+		return false
+	}
 }
 
 // findGlobalFieldGuard is compatible with findFieldGuardResolver.
